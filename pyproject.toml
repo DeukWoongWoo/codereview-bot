@@ -1,0 +1,15 @@
+[project]
+name = "python-codereview-bot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.76.2",
+    "python-gitlab>=5.6.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.7",
+]
