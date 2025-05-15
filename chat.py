@@ -1,6 +1,7 @@
 from openai import OpenAI
 import os
 import time
+import yaml
 import json
 
 class Chat:
@@ -14,11 +15,11 @@ class Chat:
     def _load_prompts(self) -> dict:
         try:
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            prompts_path = os.path.join(current_dir, 'prompts.json')
+            prompts_path = os.path.join(current_dir, 'prompts.yaml')
             with open(prompts_path, 'r') as f:
-                return json.load(f)
+                return yaml.safe_load(f)
         except Exception as e:
-            print(f"Error loading prompts.json: {e}")
+            print(f"Error loading prompts.yaml: {e}")
             return {
                 "default_review_prompt": "Please review the following code patch. Focus on potential bugs, risks, and improvement suggestions.",
                 "json_format_requirement": "Provide your feedback in a strict JSON format with the following structure:\n{\n    \"lgtm\": boolean, // true if the code looks good to merge, false if there are concerns\n    \"review_comment\": string // Your detailed review comments. You can use markdown syntax in this string, but the overall response must be a valid JSON\n}\nEnsure your response is a valid JSON object."
@@ -27,7 +28,7 @@ class Chat:
     def _generate_prompt(self, patch: str) -> str:
         user_prompt = os.getenv('PROMPT', self.prompts['default_review_prompt'])
         json_format_requirement = self.prompts['json_format_requirement']
-        return f"{user_prompt}{json_format_requirement} :\n{patch}"
+        return f"{user_prompt}\n{json_format_requirement}\nPatch:\n{patch}"
 
     def code_review(self, patch: str, model: str = 'gpt-4o-mini', temperature: float = 0.0, top_p: float = 1.0, max_tokens: int = None) -> dict:
         if not patch:

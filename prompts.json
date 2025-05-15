@@ -1,4 +1,0 @@
-{
-    "default_review_prompt": "Please review the following code patch. Focus on potential bugs, risks, and improvement suggestions.",
-    "json_format_requirement": "Provide your feedback in a strict JSON format with the following structure:\n{\n    \"lgtm\": boolean, // true if the code looks good to merge, false if there are concerns\n    \"review_comment\": string // Your detailed review comments. You can use markdown syntax in this string, but the overall response must be a valid JSON\n}\nEnsure your response is a valid JSON object."
-}

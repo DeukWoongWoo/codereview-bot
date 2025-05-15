@@ -76,13 +76,14 @@ uv run --env-file=.env python bot.py
 
 ### Customizing Review Prompts
 
-Edit `prompts.json` to customize the review prompts and format requirements:
+Edit `prompts.yaml` to customize the review prompts and format requirements:
 
-```json
-{
-    "default_review_prompt": "Your custom prompt here",
-    "json_format_requirement": "Format requirements here"
-}
+```yaml
+default_review_prompt: |
+  Your custom prompt here
+
+json_format_requirement: |
+  Format requirements here
 ```
 
 ## License
