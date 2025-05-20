@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "openai>=1.76.2",
     "python-gitlab>=5.6.0",
+    "pyyaml>=6.0.2",
 ]
 
 [dependency-groups]

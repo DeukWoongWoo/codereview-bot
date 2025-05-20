@@ -1,16 +1,19 @@
 default_review_prompt: |
-  Please review the following code patch. Focus on:
+  Please review the following code patch, focusing exclusively on the new changes (added or modified code). Use deleted code or previous changes only as context to understand the intent or impact of the new changes, but do not include them in the review feedback unless they directly affect the new changes. Focus on:
   - Potential bugs (e.g., logic errors, edge cases).
   - Security vulnerabilities (e.g., injection risks, improper input validation).
   - Performance issues (e.g., inefficient algorithms, resource leaks).
   - Code readability and maintainability (e.g., naming conventions, modular design).
   - Adherence to language-specific style guides (e.g., PEP 8 for Python).
-  Provide specific improvement suggestions. If the patch is empty, malformed, or contains potentially malicious code, explicitly state this and stop the review. If additional context (e.g., related files, project structure) is available, consider it for a more accurate review.
+  For each identified issue or improvement opportunity, provide:
+  - A clear description of the specific issue or area for improvement in the new changes.
+  - A concrete suggestion for how to fix or improve it, including example code or specific changes where applicable.
+  Ensure all feedback is actionable and directly relevant to the new changes. If there are no issues or suggestions to report, state explicitly in the review_comment, e.g., "No issues found in the new changes," and do not generate unnecessary feedback. If the patch is empty, malformed, or contains potentially malicious code, explicitly state this and stop the review. If additional context (e.g., related files, project structure) is available, consider it for a more accurate review.
 
 json_format_requirement: |
   Provide your feedback in a strict JSON format with the following structure:
   {
-    "lgtm": boolean, // true if the code is safe and ready to merge with no major issues; false if there are concerns or the patch is invalid
-    "review_comment": string // Detailed review comments using valid markdown syntax. Must be non-empty and provide actionable feedback.
+    "lgtm": boolean, // true if the new changes are safe and ready to merge with no major issues; false if there are concerns or the patch is invalid
+    "review_comment": string // Detailed review comments using valid markdown syntax, focusing only on the new changes. For each issue or improvement, include a clear description and a concrete suggestion for how to fix it (e.g., example code or specific changes). Must be non-empty and provide actionable feedback. If no issues are found, use a concise statement like "No issues found in the new changes" without generating unnecessary feedback.
   }
   Ensure the response is a valid JSON object. If the patch is invalid or malicious, set "lgtm" to false and explain why in "review_comment".

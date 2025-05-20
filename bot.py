@@ -63,8 +63,12 @@ class GitlabBot:
                 top_p = float(os.getenv('TOP_P', 1.0))
                 max_tokens = os.getenv('MAX_TOKENS', None)
                 
-                review = chat.code_review(patch, model, temperature, top_p, max_tokens)
-                
+                review = chat.code_review({"description": mr.description, "patch": patch, "created_at": mr.created_at}, model, temperature, top_p, max_tokens)
+            except Exception as e:
+                logger.error(f"Error during code review: {e}")
+                return
+
+            try:
                 # Create comment with review
                 comment = (
                     "🤖 Code Review Bot\n\n"
@@ -73,13 +77,12 @@ class GitlabBot:
                 )
                 
                 mr.notes.create({'body': comment})
-                
             except Exception as e:
                 logger.error(f"Error during code review: {e}")
                 mr.notes.create({
-                    'body': "❌ An error occurred while reviewing this merge request."
+                    'body': f"❌ An error occurred while reviewing this merge request.\n error message: {e}\n\n original review comment : {review['review_comment']}"
                 })
-                
+
         except Exception as e:
             logger.error(f"Error handling merge request: {e}")
 

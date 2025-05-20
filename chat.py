@@ -28,7 +28,7 @@ class Chat:
     def _generate_prompt(self, patch: str) -> str:
         user_prompt = os.getenv('PROMPT', self.prompts['default_review_prompt'])
         json_format_requirement = self.prompts['json_format_requirement']
-        return f"{user_prompt}\n{json_format_requirement}\nPatch:\n{patch}"
+        return f"{user_prompt}\n{json_format_requirement}:\n{patch}"
 
     def code_review(self, patch: str, model: str = 'gpt-4o-mini', temperature: float = 0.0, top_p: float = 1.0, max_tokens: int = None) -> dict:
         if not patch:
@@ -58,6 +58,9 @@ class Chat:
                 content = content[:-3]
             
             return json.loads(content)
+        except Exception as e:
+            logger.error(f"Error during code review: {e}")
+            raise e
         finally:
             print(f"Code review took {time.time() - start_time:.2f} seconds")
  
