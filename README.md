@@ -6,14 +6,19 @@ An automated code review bot for GitLab merge requests using OpenAI's GPT models
 
 - Automated code review for GitLab merge requests
 - Integration with OpenAI's GPT models
+- Powered by the official [OpenAI Python SDK](https://github.com/openai/openai-python)
+- Reviews are generated using the SDK's Assistant agent
 - Customizable review prompts
 - Detailed feedback including LGTM status and improvement suggestions
+- Large patches are automatically split into multiple review requests
 
 ## Prerequisites
 
 - Python 3.11 or higher
 - GitLab account with API access
 - OpenAI API key
+- [OpenAI Python SDK](https://github.com/openai/openai-python)
+- [MLflow](https://mlflow.org/) with Prompt Registry enabled
 - [uv](https://github.com/astral-sh/uv) package manager
 
 ## Local Setup
@@ -59,6 +64,11 @@ uv run --env-file=.env python bot.py
 - `TOP_P`: Top P sampling (default: 1.0)
 - `MAX_TOKENS`: Maximum tokens for response (optional)
 - `PROMPT`: Custom review prompt (optional)
+- `OPENAI_ASSISTANT_ID`: Reuse an existing Assistant ID for the review agent (optional)
+- `DEFAULT_PROMPT_NAME`: MLflow prompt name containing the review instructions (default: `default_review_prompt`)
+- `JSON_FORMAT_PROMPT_NAME`: MLflow prompt name with the JSON format requirement (default: `json_format_requirement`)
+- `MLFLOW_TRACKING_URI`: MLflow tracking server URI if using a remote registry
+- `CHUNK_SIZE`: Maximum characters per review request chunk (optional)
 
 ## Docker Setup
 
@@ -76,14 +86,12 @@ uv run --env-file=.env python bot.py
 
 ### Customizing Review Prompts
 
-Edit `prompts.yaml` to customize the review prompts and format requirements:
+Store custom prompts in the MLflow Prompt Registry and set the prompt names via
+environment variables:
 
-```yaml
-default_review_prompt: |
-  Your custom prompt here
-
-json_format_requirement: |
-  Format requirements here
+```bash
+export DEFAULT_PROMPT_NAME=my-review-prompt
+export JSON_FORMAT_PROMPT_NAME=my-format-prompt
 ```
 
 ## License
