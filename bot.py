@@ -61,9 +61,25 @@ class GitlabBot:
                 model = os.getenv('MODEL', 'gpt-4o-mini')
                 temperature = float(os.getenv('TEMPERATURE', 0.0))
                 top_p = float(os.getenv('TOP_P', 1.0))
-                max_tokens = os.getenv('MAX_TOKENS', None)
+                # max_tokens in chat.code_review is now max_tokens_for_response
+                max_tokens_for_response = os.getenv('MAX_TOKENS', None)
+                if max_tokens_for_response is not None:
+                    try:
+                        max_tokens_for_response = int(max_tokens_for_response)
+                    except ValueError:
+                        logger.warning(f"Invalid value for MAX_TOKENS: '{max_tokens_for_response}'. Using None.")
+                        max_tokens_for_response = None
                 
-                review = chat.code_review({"description": mr.description, "patch": patch, "created_at": mr.created_at}, model, temperature, top_p, max_tokens)
+                # chat.code_review now expects the patch string directly as the first argument.
+                # Other metadata like description, created_at are not directly used by chat.py's prompt generation anymore.
+                # If they are needed, chat.py's _generate_prompt would need to be adapted.
+                review = chat.code_review(
+                    patch=patch,
+                    model=model,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens_for_response=max_tokens_for_response
+                )
             except Exception as e:
                 logger.error(f"Error during code review: {e}")
                 return
@@ -78,9 +94,14 @@ class GitlabBot:
                 
                 mr.notes.create({'body': comment})
             except Exception as e:
-                logger.error(f"Error during code review: {e}")
-                mr.notes.create({
-                    'body': f"❌ An error occurred while reviewing this merge request.\n error message: {e}\n\n original review comment : {review['review_comment']}"
+                logger.error(f"Error posting review comment to GitLab: {e}")
+                # Attempt to post a simplified error message to GitLab if the original comment fails
+                try:
+                    mr.notes.create({
+                        'body': f"❌ An error occurred while trying to post the full review comment.\nError: {e}"
+                    })
+                except Exception as inner_e:
+                    logger.error(f"Failed to post even a simplified error comment to GitLab: {inner_e}")
                 })
 
         except Exception as e:
