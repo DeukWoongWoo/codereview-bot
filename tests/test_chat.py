@@ -64,57 +64,7 @@ MLFLOW_PROMPTS = {
 }
 MLFLOW_PROMPTS_YAML_CONTENT = yaml.dump(MLFLOW_PROMPTS)
 
-# Test class for general Chat functionalities (excluding specific _load_prompts and chunking)
-class TestChatBase(unittest.TestCase):
-
-    @patch('chat.Chat._load_prompts')
-    def setUp(self, mock_load_prompts):
-        mock_load_prompts.return_value = SAMPLE_YAML_PROMPTS # Default for these tests
-        self.chat = Chat(api_key="test_api_key")
-        self.chat.openai = MagicMock() # Mock OpenAI client
-
-    def test_generate_prompt_default(self):
-        # Use CHAT_ACTUAL_DEFAULT_PROMPTS which is imported from chat.py
-        self.chat.prompts = CHAT_ACTUAL_DEFAULT_PROMPTS
-        patch_content = "test patch content"
-        # Check against the structure _generate_prompt now creates
-        expected_prompt_string = f"{CHAT_ACTUAL_DEFAULT_PROMPTS['default_review_prompt']}\n{CHAT_ACTUAL_DEFAULT_PROMPTS['json_format_requirement']}\n--- BEGIN PATCH ---\n{patch_content}\n--- END PATCH ---"
-
-        with patch.dict(os.environ, {}, clear=True):
-             actual_prompt_string = self.chat._generate_prompt(patch_content)
-        self.assertEqual(actual_prompt_string, expected_prompt_string)
-
-    @patch.dict(os.environ, {"PROMPT": "Custom prompt from ENV VAR"})
-    def test_generate_prompt_with_env_var(self):
-        self.chat.prompts = CHAT_ACTUAL_DEFAULT_PROMPTS
-        patch_content = "test patch content"
-        env_prompt = "Custom prompt from ENV VAR"
-        expected_prompt_string = f"{env_prompt}\n{CHAT_ACTUAL_DEFAULT_PROMPTS['json_format_requirement']}\n--- BEGIN PATCH ---\n{patch_content}\n--- END PATCH ---"
-
-        actual_prompt_string = self.chat._generate_prompt(patch_content)
-        self.assertEqual(actual_prompt_string, expected_prompt_string)
-
-    # Test for code_review (non-chunking aspects) can remain here or move to a dedicated class
-    # For now, keeping simple success/error cases here. Chunking tests will be separate.
-    @patch('chat.MODEL_TOKEN_LIMITS', {'gpt-test': 10000}) # Ensure no chunking for this test
-    @patch('chat.Chat._get_token_count', return_value=100) # Mock token count to be low
-    def test_code_review_success_no_chunking(self, mock_get_tokens, mock_model_limits):
-        self.chat.prompts = SAMPLE_YAML_PROMPTS # Ensure prompts are loaded for _generate_prompt
-        patch_content = "short patch"
-        expected_review = {"lgtm": True, "review_comment": "Looks good!"}
-
-        mock_completion = MagicMock()
-        mock_completion.choices = [MagicMock(message=MagicMock(content=json.dumps(expected_review)))]
-        self.chat.openai.chat.completions.create.return_value = mock_completion
-
-        with patch('chat.logger') as mock_logger: # Mock logger to check timing log
-            review = self.chat.code_review(patch_content, model="gpt-test")
-
-        self.assertEqual(review, expected_review)
-        self.chat.openai.chat.completions.create.assert_called_once()
-        # Check that the logger.info about single chunk was called
-        self.assertTrue(any("Processing as a single request" in call_args[0][0] for call_args in mock_logger.info.call_args_list))
-
+# TestChatBase removed as its tests (_generate_prompt, old code_review) are for obsolete methods
 
 # Separate class for testing the _load_prompts logic with MLflow and fallbacks
 class TestChatPromptLoading(unittest.TestCase):
@@ -261,202 +211,267 @@ class TestChatPromptLoading(unittest.TestCase):
         self.mock_logger.info.assert_any_call("Local prompts.yaml not found.")
         self.mock_logger.warning.assert_any_call("Falling back to hardcoded default prompts.")
 
+# Removing TestChatCodeReviewChunking as its tests (_get_token_count, _split_patch, old code_review chunking) are for obsolete methods
 
-# Placeholder for chunking tests - to be implemented next
-class TestChatCodeReviewChunking(unittest.TestCase):
+# TestChatPromptLoading remains relevant and is kept.
+
+
+# --- New Test Class for Assistants API ---
+TEST_PROMPTS_FOR_ASSISTANT = {
+    'default_review_prompt': 'Test assistant instructions for review.',
+    'json_format_requirement': 'Output in JSON: {"lgtm": bool, "review_comment": "your_review_here"}'
+}
+
+class TestChatAssistantsAPI(unittest.TestCase):
     def setUp(self):
-        # Mock Chat's _load_prompts to return some default prompts for these tests
-        # This avoids dealing with MLflow/file loading here.
+        # Patch OpenAI client initialized in Chat
+        self.mock_openai_client_patch = patch('chat.OpenAI')
+        self.MockOpenAIClass = self.mock_openai_client_patch.start()
+        self.mock_client_instance = self.MockOpenAIClass.return_value
+        self.mock_client_instance.beta = MagicMock() # Mock the .beta attribute
+
+        # Mock _load_prompts for Chat instance
         self.mock_load_prompts_patch = patch('chat.Chat._load_prompts')
-        self.MockLoadPrompts = self.mock_load_prompts_patch.start()
-        self.MockLoadPrompts.return_value = CHAT_ACTUAL_DEFAULT_PROMPTS
+        self.mock_load_prompts = self.mock_load_prompts_patch.start()
+        self.mock_load_prompts.return_value = TEST_PROMPTS_FOR_ASSISTANT
 
-        self.chat = Chat(api_key="test_api_key")
-        self.chat.openai = MagicMock() # Mock OpenAI client
+        # Mock time.sleep to speed up tests
+        self.mock_time_sleep = patch('time.sleep').start()
 
-         # Mock tiktoken
-        self.mock_tiktoken_encoding_for_model = patch('chat.tiktoken.encoding_for_model').start()
-        self.mock_encoder = MagicMock()
-        self.mock_tiktoken_encoding_for_model.return_value = self.mock_encoder
-        # Default behavior for encode: return list with length of string / 4 (approx)
-        self.mock_encoder.encode.side_effect = lambda text: list(range(len(text) // 4))
+        # Mock logger to check log messages
+        self.mock_logger = patch('chat.logger').start()
+
+        # Default assistant name for tests
+        self.assistant_name = "GitLabCodeReviewAssistant" # Matches default in chat.py
 
 
     def tearDown(self):
         patch.stopall()
 
-    def test_get_token_count_known_model(self):
-        self.mock_encoder.encode.return_value = [1, 2, 3, 4, 5] # Simulate 5 tokens
-        count = self.chat._get_token_count("some text", "gpt-4o-mini")
-        self.assertEqual(count, 5)
-        self.mock_tiktoken_encoding_for_model.assert_called_once_with("gpt-4o-mini")
-        self.mock_encoder.encode.assert_called_once_with("some text")
+    # --- Tests for _initialize_assistant ---
+    @patch.dict(os.environ, {"OPENAI_ASSISTANT_ID": "asst_env_id_123"})
+    def test_initialize_assistant_from_env_id_success(self):
+        mock_retrieved_assistant = MagicMock(id="asst_env_id_123", name="EnvAssistant")
+        self.mock_client_instance.beta.assistants.retrieve.return_value = mock_retrieved_assistant
 
-    @patch('chat.tiktoken.get_encoding') # For fallback
-    def test_get_token_count_unknown_model_fallback(self, mock_get_encoding):
-        self.mock_tiktoken_encoding_for_model.side_effect = KeyError("Model not found")
-        mock_default_encoder = MagicMock()
-        mock_default_encoder.encode.return_value = [1,2,3]
-        mock_get_encoding.return_value = mock_default_encoder
+        # Pass a dummy model, actual model comes from env or chat.py default in Chat.__init__
+        chat_instance = Chat(api_key="test_key")
 
-        with patch('chat.logger') as mock_logger:
-            count = self.chat._get_token_count("text", "unknown-model")
+        self.assertEqual(chat_instance.assistant_id, "asst_env_id_123")
+        self.mock_client_instance.beta.assistants.retrieve.assert_called_once_with(assistant_id="asst_env_id_123")
+        self.mock_client_instance.beta.assistants.list.assert_not_called()
+        self.mock_client_instance.beta.assistants.create.assert_not_called()
+        self.mock_logger.info.assert_any_call("Successfully retrieved assistant with ID: asst_env_id_123")
 
-        self.assertEqual(count, 3)
-        mock_get_encoding.assert_called_once_with("cl100k_base") # chat.DEFAULT_ENCODER
-        mock_logger.warning.assert_called_once()
+    @patch.dict(os.environ, {"OPENAI_ASSISTANT_ID": "asst_env_id_fail", "OPENAI_ASSISTANT_NAME": "TestAssistantCreate", "MODEL": "gpt-test-model"})
+    def test_initialize_assistant_from_env_id_failure_then_create(self):
+        self.mock_client_instance.beta.assistants.retrieve.side_effect = OpenAIError("Retrieval failed")
 
-    def test_split_patch_no_split_needed(self):
-        # Mock _get_token_count to return a low number so no splitting occurs
-        self.chat._get_token_count = MagicMock(return_value=10)
-        patch_content = "diff --git a/file1.py b/file1.py\n--- a/file1.py\n+++ b/file1.py\n@@ -1,1 +1,1 @@\n-old\n+new"
-        chunks = self.chat._split_patch(patch_content, max_tokens_per_chunk=100, model="gpt-test")
-        self.assertEqual(len(chunks), 1)
-        self.assertEqual(chunks[0], patch_content)
+        mock_empty_list_response = MagicMock()
+        mock_empty_list_response.data = []
+        self.mock_client_instance.beta.assistants.list.return_value = mock_empty_list_response
 
-    def test_split_patch_by_file(self):
-        patch_content = (
-            "diff --git a/file1.py b/file1.py\n--- a/file1.py\n+++ b/file1.py\n@@ -1,1 +1,1 @@\n-f1 old\n+f1 new\n"
-            "diff --git a/file2.py b/file2.py\n--- a/file2.py\n+++ b/file2.py\n@@ -1,1 +1,1 @@\n-f2 old\n+f2 new"
+        mock_created_assistant = MagicMock(id="asst_created_new_456", name="TestAssistantCreate")
+        self.mock_client_instance.beta.assistants.create.return_value = mock_created_assistant
+
+        chat_instance = Chat(api_key="test_key") # Uses MODEL from patched env
+
+        self.assertEqual(chat_instance.assistant_id, "asst_created_new_456")
+        self.mock_client_instance.beta.assistants.retrieve.assert_called_once_with(assistant_id="asst_env_id_fail")
+        self.mock_client_instance.beta.assistants.list.assert_called_once()
+        self.mock_client_instance.beta.assistants.create.assert_called_once_with(
+            name="TestAssistantCreate", # From env
+            instructions=TEST_PROMPTS_FOR_ASSISTANT['default_review_prompt'],
+            model="gpt-test-model", # From env
+            tools=[]
         )
-        # Mock _get_token_count: first call for file1 (fits), second for file2 (fits)
-        self.chat._get_token_count = MagicMock(side_effect=[50, 50])
-        chunks = self.chat._split_patch(patch_content, max_tokens_per_chunk=100, model="gpt-test")
-        self.assertEqual(len(chunks), 2)
-        self.assertTrue("file1.py" in chunks[0])
-        self.assertTrue("file2.py" in chunks[1])
-
-    def test_split_patch_large_file_needs_line_splitting(self):
-        file1_header = "diff --git a/file1.py b/file1.py\n--- a/file1.py\n+++ b/file1.py\n"
-        file1_line1 = "@@ -1,1 +1,1 @@\n-old line1\n+new line1\n" # assume 10 tokens
-        file1_line2 = "@@ -10,1 +10,1 @@\n-old line2\n+new line2\n" # assume 10 tokens
-        patch_content = file1_header + file1_line1 + file1_line2
-
-        # Token counts: file_diff (header+l1+l2) > max_chunk. Then lines.
-        # Header tokens (approx, as _split_patch calculates it from joined header lines)
-        header_tokens = self._calculate_mock_tokens(file1_header, self.mock_encoder.encode)
-        line1_tokens = self._calculate_mock_tokens(file1_line1, self.mock_encoder.encode)
-        line2_tokens = self._calculate_mock_tokens(file1_line2, self.mock_encoder.encode)
-
-        # Overall diff, then individual lines/headers for splitting logic
-        self.chat._get_token_count = MagicMock(side_effect=[
-            header_tokens + line1_tokens + line2_tokens, # Full file1_diff
-            header_tokens, # Header for first sub-chunk
-            line1_tokens,  # Line1 for first sub-chunk
-            header_tokens, # Header for second sub-chunk (after split)
-            line2_tokens,  # Line2 for second sub-chunk
-        ])
-
-        # Max tokens per chunk allows header + one line, but not header + two lines
-        max_tokens_per_chunk = header_tokens + line1_tokens + 5
-
-        chunks = self.chat._split_patch(patch_content, max_tokens_per_chunk=max_tokens_per_chunk, model="gpt-test")
-
-        self.assertEqual(len(chunks), 2)
-        self.assertTrue(chunks[0].startswith(file1_header.strip())) # strip because _split_patch strips file_diffs
-        self.assertTrue(file1_line1.strip() in chunks[0])
-        self.assertFalse(file1_line2.strip() in chunks[0])
-
-        self.assertTrue(chunks[1].startswith(file1_header.strip()))
-        self.assertTrue(file1_line2.strip() in chunks[1])
-        self.assertFalse(file1_line1.strip() in chunks[1])
-
-    def _calculate_mock_tokens(self, text, mock_encode_fn):
-        return len(mock_encode_fn(text))
+        self.mock_logger.warning.assert_any_call("Failed to retrieve assistant with ID 'asst_env_id_fail': Retrieval failed. Will try to find by name or create a new one.")
+        self.mock_logger.info.assert_any_call("Successfully created new assistant 'TestAssistantCreate' with ID: asst_created_new_456 and model: gpt-test-model")
 
 
-    @patch('chat.logger')
-    @patch.dict(os.environ, {"MAX_TOKENS_OVERRIDE": "500"}) # Mock env var for model token limit
-    def test_code_review_successful_chunking(self, mock_logger):
-        # Setup: patch that needs chunking, mock OpenAI response for chunks
-        long_patch = "diff --git a/file1.py b/file1.py\n" + "a" * 200 + "\ndiff --git a/file2.py b/file2.py\n" + "b" * 200
-        # Mock _get_token_count to simulate token counts that trigger chunking
-        # template_tokens + patch_tokens > max_total_tokens
-        # Then _split_patch will be called. Let _split_patch use its own _get_token_count calls.
+    @patch.dict(os.environ, {"OPENAI_ASSISTANT_ID": "", "OPENAI_ASSISTANT_NAME": "ExistingAssistant"})
+    def test_initialize_assistant_find_by_name_success(self):
+        mock_assistant_in_list = MagicMock(id="asst_found_by_name_789", name="ExistingAssistant")
+        mock_list_response = MagicMock()
+        mock_list_response.data = [MagicMock(id="other_asst_000", name="Other"), mock_assistant_in_list]
+        self.mock_client_instance.beta.assistants.list.return_value = mock_list_response
 
-        # Mock parts of the token calculation in code_review
-        self.chat._get_prompt_template_tokens = MagicMock(return_value=50) # Template tokens
+        chat_instance = Chat(api_key="test_key")
 
-        # Token counts for full patch, then for chunks by _split_patch
-        # Full patch tokens: 200 (template + patch) > 150 (max_total_tokens for patch part)
-        # Chunk1 tokens: 100
-        # Chunk2 tokens: 100
-        # self.chat._get_token_count needs to be versatile here.
-        # For the initial check in code_review:
-        #   - full_prompt_text_for_calc (template + markers + long_patch) -> e.g., 250 tokens
-        # For _split_patch:
-        #   - file1_diff (approx 100 + header) -> e.g., 110
-        #   - file2_diff (approx 100 + header) -> e.g., 110
+        self.assertEqual(chat_instance.assistant_id, "asst_found_by_name_789")
+        self.mock_client_instance.beta.assistants.retrieve.assert_not_called()
+        self.mock_client_instance.beta.assistants.list.assert_called_once()
+        self.mock_client_instance.beta.assistants.create.assert_not_called()
+        self.mock_logger.info.assert_any_call("Found existing assistant by name: 'ExistingAssistant' with ID: asst_found_by_name_789")
 
-        # Simplified: Assume _split_patch works and returns 2 chunks.
-        # We need to control the main token check in code_review.
-        # Max total tokens for model: 500 (from env var)
-        # Template tokens: 50
-        # PROMPT_RESPONSE_BUFFER: 1024 (from chat.py) -> This buffer makes it hard to test chunking unless limit is high
-        # Let's patch PROMPT_RESPONSE_BUFFER for this test
-        with patch('chat.PROMPT_RESPONSE_BUFFER', 50):
-            # max_patch_tokens_for_single_request = 500 - 50 - 50 = 400
-            # If full_prompt_text_for_calc > 500, chunking happens.
-            # Let's say full_prompt_text_for_calc is 510.
+    @patch.dict(os.environ, {"OPENAI_ASSISTANT_ID": "", "OPENAI_ASSISTANT_NAME": "NewUniqueAssistant"})
+    def test_initialize_assistant_create_new_if_not_found(self):
+        mock_empty_list_response = MagicMock()
+        mock_empty_list_response.data = []
+        self.mock_client_instance.beta.assistants.list.return_value = mock_empty_list_response
 
-            # Mock _get_token_count specifically for the initial check and for _split_patch
-            def mock_token_side_effect(text, model_name):
-                if "--- BEGIN PATCH ---" in text and "END PATCH" in text and len(text) > 100: # Full prompt
-                    return 510 # Triggers chunking
-                elif "file1.py" in text: return 100 # Chunk 1 patch content
-                elif "file2.py" in text: return 100 # Chunk 2 patch content
-                else: return len(text) // 4 # Generic fallback for other calls (e.g. template itself)
-            self.chat._get_token_count = MagicMock(side_effect=mock_token_side_effect)
+        mock_created_assistant = MagicMock(id="asst_newly_created_111", name="NewUniqueAssistant")
+        self.mock_client_instance.beta.assistants.create.return_value = mock_created_assistant
 
-            # Mock _split_patch to return predictable chunks
-            chunk1_content = "diff --git a/file1.py b/file1.py\n" + "a" * 200
-            chunk2_content = "diff --git a/file2.py b/file2.py\n" + "b" * 200
-            self.chat._split_patch = MagicMock(return_value=[chunk1_content, chunk2_content])
+        # Ensure MODEL env var is not set to test chat.py's default model for assistant creation
+        with patch.dict(os.environ, {"MODEL": ""}, clear=True): # Temporarily clear MODEL for this test scope
+            # Need to set OPENAI_ASSISTANT_NAME again as clear=True wipes it
+            os.environ["OPENAI_ASSISTANT_NAME"] = "NewUniqueAssistant"
+            chat_instance = Chat(api_key="test_key")
 
-            # Mock OpenAI API responses for each chunk
-            response_chunk1 = {"lgtm": True, "review_comment": "Review for file1."}
-            response_chunk2 = {"lgtm": False, "review_comment": "Review for file2 needs work."}
-
-            mock_completion_chunk1 = MagicMock()
-            mock_completion_chunk1.choices = [MagicMock(message=MagicMock(content=json.dumps(response_chunk1)))]
-            mock_completion_chunk2 = MagicMock()
-            mock_completion_chunk2.choices = [MagicMock(message=MagicMock(content=json.dumps(response_chunk2)))]
-
-            self.chat.openai.chat.completions.create.side_effect = [mock_completion_chunk1, mock_completion_chunk2]
-
-            result = self.chat.code_review(long_patch, model="gpt-test")
-
-            self.assertEqual(self.chat.openai.chat.completions.create.call_count, 2)
-            self.assertFalse(result["lgtm"])
-            self.assertIn("--- Review for Chunk 1/2 ---", result["review_comment"])
-            self.assertIn("Review for file1.", result["review_comment"])
-            self.assertIn("--- Review for Chunk 2/2 ---", result["review_comment"])
-            self.assertIn("Review for file2 needs work.", result["review_comment"])
-            mock_logger.info.assert_any_call("Patch exceeds token limits (510 > 500). Splitting into chunks.")
+        self.assertEqual(chat_instance.assistant_id, "asst_newly_created_111")
+        self.mock_client_instance.beta.assistants.create.assert_called_once_with(
+            name="NewUniqueAssistant",
+            instructions=TEST_PROMPTS_FOR_ASSISTANT['default_review_prompt'],
+            model="gpt-4o", # Default from Chat class
+            tools=[]
+        )
+        self.assertEqual(chat_instance.assistant_name, "NewUniqueAssistant")
 
 
-    @patch('chat.logger')
-    @patch.dict(os.environ, {"MAX_TOKENS_OVERRIDE": "500", "MAX_REVIEW_CHUNKS": "1"})
-    def test_code_review_too_many_chunks(self, mock_logger):
-        long_patch = "diff --git a/file1.py b/file1.py\n" + "a" * 200 + "\ndiff --git a/file2.py b/file2.py\n" + "b" * 200
+    @patch.dict(os.environ, {"OPENAI_ASSISTANT_ID": "", "OPENAI_ASSISTANT_NAME": "FailAssistant"})
+    def test_initialize_assistant_all_fail_raises_exception(self):
+        self.mock_client_instance.beta.assistants.retrieve.side_effect = OpenAIError("Retrieve failed")
+        self.mock_client_instance.beta.assistants.list.side_effect = OpenAIError("List failed")
+        self.mock_client_instance.beta.assistants.create.side_effect = OpenAIError("Create failed")
 
-        with patch('chat.PROMPT_RESPONSE_BUFFER', 50): # Keep buffer small for easier calculation
-            # Simulate initial token calculation that triggers chunking
-            self.chat._get_prompt_template_tokens = MagicMock(return_value=50)
-            def mock_token_side_effect_initial(text, model_name):
-                if "--- BEGIN PATCH ---" in text: return 510 # Force chunking
-                return len(text) // 4
-            self.chat._get_token_count = MagicMock(side_effect=mock_token_side_effect_initial)
+        with self.assertRaisesRegex(Exception, "Failed to initialize or create OpenAI assistant after all attempts"):
+            Chat(api_key="test_key")
 
-            # Mock _split_patch to return more chunks than allowed
-            self.chat._split_patch = MagicMock(return_value=["chunk1_content", "chunk2_content"]) # 2 chunks > MAX_REVIEW_CHUNKS (1)
+    # --- Tests for code_review and _wait_for_run_completion ---
+    def test_code_review_success(self):
+        # Chat instance is created, _initialize_assistant is called. Let's assume it sets an ID.
+        # For this test, we can directly set chat_instance.assistant_id after Chat() if needed,
+        # or ensure setUp's mocks for _initialize_assistant lead to a valid ID.
+        # Here, _load_prompts is mocked, so assistant creation inside _initialize_assistant uses default instructions.
 
-            result = self.chat.code_review(long_patch, model="gpt-test")
+        # To ensure assistant_id is set before code_review is called:
+        # One way: mock _initialize_assistant itself
+        with patch.object(Chat, '_initialize_assistant', autospec=True) as mock_init_asst:
+            chat_instance = Chat(api_key="test_key")
+            chat_instance.assistant_id = "asst_test_id" # Manually set for clarity in test focus
+            mock_init_asst.assert_called_once() # Ensure it was called by __init__
 
-            self.assertFalse(result["lgtm"])
-            self.assertIn("Error: Diff is too large, resulting in 2 chunks (max 1).", result["review_comment"])
-            self.chat.openai.chat.completions.create.assert_not_called() # API should not be called
-            mock_logger.error.assert_any_call("Splitting resulted in 2 chunks, exceeding MAX_REVIEW_CHUNKS (1).")
+        mock_thread = MagicMock(id="thread_abc")
+        self.mock_client_instance.beta.threads.create.return_value = mock_thread
+
+        mock_run_params = {
+            "assistant_id": "asst_test_id",
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "max_completion_tokens": 500,
+            "model": "gpt-override-model" # Test model override
+        }
+        mock_run_create_obj = MagicMock(id="run_xyz", status="queued", **run_params)
+        self.mock_client_instance.beta.threads.runs.create.return_value = mock_run_create_obj
+
+        mock_run_in_progress = MagicMock(id="run_xyz", status="in_progress")
+        mock_run_completed = MagicMock(id="run_xyz", status="completed")
+        self.mock_client_instance.beta.threads.runs.retrieve.side_effect = [
+            mock_run_in_progress,
+            mock_run_completed
+        ]
+
+        mock_assistant_message_content = MagicMock(type="text", text=MagicMock(value=json.dumps({"lgtm": True, "review_comment": "All good!"})))
+        mock_assistant_message = MagicMock(role="assistant", content=[mock_assistant_message_content])
+        mock_messages_list = MagicMock(data=[mock_assistant_message])
+        self.mock_client_instance.beta.threads.messages.list.return_value = mock_messages_list
+
+        review = chat_instance.code_review("test patch", model="gpt-override-model", temperature=0.1, top_p=0.9, max_tokens_for_response=500)
+
+        self.assertEqual(review, {"lgtm": True, "review_comment": "All good!"})
+        self.mock_client_instance.beta.threads.create.assert_called_once()
+        self.mock_client_instance.beta.threads.messages.create.assert_called_once()
+        self.mock_client_instance.beta.threads.runs.create.assert_called_once_with(thread_id=mock_thread.id, **mock_run_params)
+        self.assertEqual(self.mock_client_instance.beta.threads.runs.retrieve.call_count, 2)
+        self.mock_client_instance.beta.threads.messages.list.assert_called_once_with(thread_id=mock_thread.id, order="desc", limit=1)
+
+    def test_code_review_run_fails(self):
+        with patch.object(Chat, '_initialize_assistant', autospec=True): # Mock init to simplify
+            chat_instance = Chat(api_key="test_key")
+            chat_instance.assistant_id = "asst_test_id"
+
+        self.mock_client_instance.beta.threads.create.return_value = MagicMock(id="thread_fail")
+        self.mock_client_instance.beta.threads.runs.create.return_value = MagicMock(id="run_fail", status="queued")
+
+        mock_run_failed_error = MagicMock(code="server_error", message="Server exploded")
+        mock_run_failed = MagicMock(id="run_fail", status="failed", last_error=mock_run_failed_error)
+        self.mock_client_instance.beta.threads.runs.retrieve.return_value = mock_run_failed
+
+        review = chat_instance.code_review("test patch for failure")
+
+        self.assertFalse(review["lgtm"])
+        self.assertIn("Review failed. Run status: failed.", review["review_comment"])
+        self.assertIn("Server exploded", review["review_comment"])
+
+    @patch('time.time')
+    def test_code_review_run_timeout_in_wait_method(self, mock_time_time_func):
+        # Test _wait_for_run_completion directly for timeout
+        with patch.object(Chat, '_initialize_assistant', autospec=True):
+            chat_instance = Chat(api_key="test_key")
+            # No need to set assistant_id as we are testing _wait_for_run_completion directly
+
+        mock_start_time = 1000.0
+        mock_time_time_func.side_effect = [
+            mock_start_time,       # Call in _wait_for_run_completion start
+            mock_start_time + 1,   # First loop check
+            mock_start_time + 6    # Second loop check, timeout (5s + 1s margin)
+        ]
+        self.mock_client_instance.beta.threads.runs.retrieve.return_value = MagicMock(status="in_progress")
+
+        with self.assertRaises(TimeoutError):
+            chat_instance._wait_for_run_completion("thread_timeout_direct", "run_timeout_direct", timeout_seconds=5)
+
+    def test_code_review_catches_timeout_from_wait(self):
+        # Test that code_review catches TimeoutError from _wait_for_run_completion
+        with patch.object(Chat, '_initialize_assistant', autospec=True), \
+             patch.object(Chat, '_wait_for_run_completion', side_effect=TimeoutError("Simulated timeout in wait")) as mock_wait:
+            chat_instance = Chat(api_key="test_key")
+            chat_instance.assistant_id = "asst_test_id" # Ensure assistant ID is set
+
+            self.mock_client_instance.beta.threads.create.return_value = MagicMock(id="thread_timeout_catch")
+            self.mock_client_instance.beta.threads.runs.create.return_value = MagicMock(id="run_timeout_catch", status="queued")
+
+            review = chat_instance.code_review("test patch for caught timeout")
+
+            self.assertFalse(review["lgtm"])
+            self.assertIn("Error: Code review timed out - Simulated timeout in wait", review["review_comment"])
+            mock_wait.assert_called_once()
+
+
+    def test_code_review_assistant_returns_invalid_json(self):
+        with patch.object(Chat, '_initialize_assistant', autospec=True):
+            chat_instance = Chat(api_key="test_key")
+            chat_instance.assistant_id = "asst_test_id"
+
+        self.mock_client_instance.beta.threads.create.return_value = MagicMock(id="thread_json_err")
+        mock_run_completed = MagicMock(id="run_json_err", status="completed")
+        self.mock_client_instance.beta.threads.runs.create.return_value = mock_run_completed
+        self.mock_client_instance.beta.threads.runs.retrieve.return_value = mock_run_completed
+
+        invalid_json_string = "This is not JSON { definitely not"
+        mock_assistant_message_content = MagicMock(type="text", text=MagicMock(value=invalid_json_string))
+        mock_assistant_message = MagicMock(role="assistant", content=[mock_assistant_message_content])
+        mock_messages_list = MagicMock(data=[mock_assistant_message])
+        self.mock_client_instance.beta.threads.messages.list.return_value = mock_messages_list
+
+        review = chat_instance.code_review("test patch for invalid json")
+
+        self.assertFalse(review["lgtm"])
+        self.assertIn("Error: Could not parse AI response.", review["review_comment"])
+        self.assertIn(f"Raw: {invalid_json_string}", review["review_comment"])
+
+
+    def test_code_review_empty_patch(self):
+        with patch.object(Chat, '_initialize_assistant', autospec=True):
+            chat_instance = Chat(api_key="test_key")
+            chat_instance.assistant_id = "asst_test_id"
+
+        review = chat_instance.code_review("")
+
+        self.assertTrue(review["lgtm"])
+        self.assertEqual(review["review_comment"], "")
+        self.mock_client_instance.beta.threads.create.assert_not_called()
 
 
 if __name__ == '__main__':

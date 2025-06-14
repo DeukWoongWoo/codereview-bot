@@ -6,32 +6,189 @@ import json
 import logging
 import mlflow
 from mlflow.exceptions import MlflowException
-import tiktoken # For token counting and chunking
-# yaml is imported lower down. os, time, json are also used.
+# tiktoken import removed as chunking methods are being removed.
+# yaml, os, time, json, logging, mlflow, MlflowException are used.
+from openai import OpenAI, OpenAIError # Ensure OpenAIError is imported
 
 logger = logging.getLogger(__name__)
 
-# Default model token limits (conservative estimates)
-MODEL_TOKEN_LIMITS = {
-    'gpt-4o-mini': 128000,
-    'gpt-4': 8192,
-    'gpt-3.5-turbo': 4096, # Older versions might be 4k, newer 16k. Check specific variant.
-    'text-davinci-003': 4000, # Example, if using older completion models
-}
-DEFAULT_ENCODER = "cl100k_base" # A common encoder
-
-# Max chunks to split a review into, to prevent excessive API calls
-DEFAULT_MAX_REVIEW_CHUNKS = 10
-# Buffer tokens to leave for the model's response and JSON structure
-PROMPT_RESPONSE_BUFFER = 1024 # Increased buffer
+# Removed: MODEL_TOKEN_LIMITS, DEFAULT_ENCODER, DEFAULT_MAX_REVIEW_CHUNKS, PROMPT_RESPONSE_BUFFER
+# These constants were related to manual chunking.
 
 class Chat:
     def __init__(self, api_key: str):
-        self.openai = OpenAI(
+        self.client = OpenAI( # Changed self.openai to self.client
             api_key=api_key,
-            base_url="https://api.openai.com/v1"
+            base_url=os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
         )
-        self.prompts = self._load_prompts()
+        self.assistant_id = os.getenv("OPENAI_ASSISTANT_ID")
+        self.assistant_name = os.getenv("OPENAI_ASSISTANT_NAME", "GitLabCodeReviewAssistant")
+        self.model = os.getenv("MODEL", "gpt-4o") # Default to a newer model
+
+        self.prompts = self._load_prompts() # For assistant instructions & JSON format requirement
+        self._initialize_assistant()
+
+    def _initialize_assistant(self):
+        logger.info("Initializing OpenAI Assistant...")
+        if self.assistant_id:
+            try:
+                assistant = self.client.beta.assistants.retrieve(assistant_id=self.assistant_id)
+                logger.info(f"Successfully retrieved assistant with ID: {self.assistant_id}")
+                self.assistant_id = assistant.id # Ensure it's set from the retrieved object
+                return
+            except OpenAIError as e:
+                logger.warning(f"Failed to retrieve assistant with ID '{self.assistant_id}': {e}. Will try to find by name or create a new one.")
+                self.assistant_id = None # Reset ID so we try to find or create
+
+        if not self.assistant_id: # Try to find by name
+            logger.info(f"No Assistant ID from environment, trying to find assistant by name: '{self.assistant_name}'")
+            try:
+                assistants = self.client.beta.assistants.list(limit=100)
+                for assistant_data in assistants.data:
+                    if assistant_data.name == self.assistant_name:
+                        self.assistant_id = assistant_data.id
+                        logger.info(f"Found existing assistant by name: '{self.assistant_name}' with ID: {self.assistant_id}")
+                        return
+            except OpenAIError as e:
+                logger.error(f"Error listing assistants: {e}. Proceeding to create a new assistant.")
+
+        if not self.assistant_id: # If still no ID, create a new assistant
+            logger.info(f"No existing assistant found by name '{self.assistant_name}'. Creating a new one.")
+            assistant_instructions = self.prompts.get('default_review_prompt', 'You are a helpful code review assistant. Please follow the provided JSON output format.')
+            try:
+                new_assistant = self.client.beta.assistants.create(
+                    name=self.assistant_name,
+                    instructions=assistant_instructions,
+                    model=self.model,
+                    tools=[] # No tools needed for this functionality yet
+                )
+                self.assistant_id = new_assistant.id
+                logger.info(f"Successfully created new assistant '{self.assistant_name}' with ID: {self.assistant_id} and model: {self.model}")
+            except OpenAIError as e:
+                logger.error(f"Failed to create new assistant: {e}")
+                raise Exception(f"Failed to initialize or create OpenAI assistant after all attempts: {e}") from e
+
+        if not self.assistant_id:
+            # This case should ideally be unreachable if creation was attempted and failed, as it would have raised.
+            # But as a safeguard:
+            logger.error("Failed to initialize or create OpenAI assistant after all attempts.")
+            raise Exception("Failed to initialize or create OpenAI assistant.")
+
+    def _wait_for_run_completion(self, thread_id: str, run_id: str, timeout_seconds: int = 300):
+        start_time = time.time()
+        logger.info(f"Waiting for run {run_id} in thread {thread_id} to complete...")
+        while True:
+            if time.time() - start_time > timeout_seconds:
+                logger.error(f"Run {run_id} timed out after {timeout_seconds} seconds.")
+                raise TimeoutError(f"Run completion timed out for run_id: {run_id}")
+
+            try:
+                run = self.client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
+            except OpenAIError as e:
+                logger.error(f"API error retrieving run {run_id}: {e}")
+                # Depending on the error, might retry or raise immediately. For now, let loop retry.
+                time.sleep(5) # Wait longer if API error
+                continue
+
+            logger.debug(f"Run {run_id} status: {run.status}")
+            if run.status == 'completed':
+                logger.info(f"Run {run_id} completed successfully.")
+                return run
+            elif run.status in ['failed', 'cancelled', 'expired']:
+                logger.error(f"Run {run_id} ended with status: {run.status}. Last error: {run.last_error}")
+                return run
+            elif run.status == 'requires_action':
+                logger.warning(f"Run {run_id} requires action, but no tools are defined. This is unexpected.")
+                # For now, we don't handle actions, so this is effectively a terminal state for this bot.
+                return run
+
+            time.sleep(2) # Poll interval for in-progress states
+
+    # Note: Old helper methods (_get_token_count, _get_prompt_template_tokens,
+    # _generate_prompt, _split_patch) are removed in this change.
+
+    def code_review(self, patch: str, model: str = None, temperature: float = None, top_p: float = None, max_tokens_for_response: int = None) -> dict:
+        if not self.assistant_id:
+            logger.error("Assistant not initialized. Cannot perform code review.")
+            return {"lgtm": False, "review_comment": "Error: Assistant not initialized."}
+        if not patch:
+            return {"lgtm": True, "review_comment": ""}
+
+        logger.info(f"Starting code review with Assistant ID: {self.assistant_id}")
+        start_time = time.time()
+
+        try:
+            thread = self.client.beta.threads.create()
+            logger.info(f"Created new thread: {thread.id}")
+
+            json_instruction = self.prompts.get('json_format_requirement', 'Output in JSON: {"lgtm": bool, "review_comment": str}')
+            message_content = (
+                f"Please review this code patch:\n\n--- BEGIN PATCH ---\n{patch}\n--- END PATCH ---\n\n"
+                f"Adhere strictly to this JSON output format:\n{json_instruction}"
+            )
+
+            self.client.beta.threads.messages.create(
+                thread_id=thread.id,
+                role="user",
+                content=message_content
+            )
+            logger.info(f"Added message to thread {thread.id}")
+
+            run_params = {"assistant_id": self.assistant_id}
+            if temperature is not None: run_params["temperature"] = temperature
+            if top_p is not None: run_params["top_p"] = top_p
+            if max_tokens_for_response is not None: run_params["max_completion_tokens"] = max_tokens_for_response
+            if model is not None: run_params["model"] = model # Override assistant's model if provided
+
+            run = self.client.beta.threads.runs.create(thread_id=thread.id, **run_params)
+            logger.info(f"Created run {run.id} for thread {thread.id} with params: {run_params}")
+
+            run_status = self._wait_for_run_completion(thread.id, run.id)
+
+            if run_status.status == 'completed':
+                messages_response = self.client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
+
+                if messages_response.data and messages_response.data[0].role == "assistant":
+                    assistant_message = messages_response.data[0]
+                    if assistant_message.content and isinstance(assistant_message.content, list) and assistant_message.content[0].type == "text":
+                        response_text = assistant_message.content[0].text.value
+                        logger.info(f"Raw response from assistant: {response_text}")
+                        try:
+                            if response_text.startswith('```json\n'): response_text = response_text[8:]
+                            if response_text.endswith('\n```'): response_text = response_text[:-4]
+                            elif response_text.endswith('```'): response_text = response_text[:-3]
+                            review_data = json.loads(response_text)
+                            return review_data
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse JSON from assistant: {e}. Response: '{response_text}'")
+                            return {"lgtm": False, "review_comment": f"Error: Could not parse AI response. Raw: {response_text}"}
+                    else:
+                        logger.error("Assistant message content not text or empty.")
+                        return {"lgtm": False, "review_comment": "Error: Assistant response empty/not text."}
+                else:
+                    logger.error("No assistant messages found after completion.")
+                    return {"lgtm": False, "review_comment": "Error: No response from assistant."}
+            else:
+                error_message = f"Review failed. Run status: {run_status.status}."
+                if run_status.last_error:
+                    error_message += f" Last Error: Code: {run_status.last_error.code}, Message: {run_status.last_error.message}"
+                logger.error(error_message)
+                return {"lgtm": False, "review_comment": error_message}
+
+        except OpenAIError as e:
+            logger.error(f"OpenAI API error during code review: {e}")
+            return {"lgtm": False, "review_comment": f"Error: OpenAI API error - {str(e)}"}
+        except TimeoutError as e:
+            logger.error(f"Timeout during code review: {e}")
+            return {"lgtm": False, "review_comment": f"Error: Code review timed out - {str(e)}"}
+        except Exception as e:
+            logger.error(f"Unexpected error during code review: {e}", exc_info=True)
+            return {"lgtm": False, "review_comment": f"Error: An unexpected error occurred - {str(e)}"}
+        finally:
+            logger.info(f"Code review process finished in {time.time() - start_time:.2f} seconds.")
+
+    # Definitions of _get_token_count, _get_prompt_template_tokens,
+    # _generate_prompt, and _split_patch are removed from here.
 
     def _load_prompts(self) -> dict:
         # Attempt to load from MLflow Prompt Registry first
@@ -97,206 +254,6 @@ class Chat:
             "json_format_requirement": "Provide your feedback in a strict JSON format with the following structure:\n{\n    \"lgtm\": boolean, // true if the code looks good to merge, false if there are concerns\n    \"review_comment\": string // Your detailed review comments. You can use markdown syntax in this string, but the overall response must be a valid JSON\n}\nEnsure your response is a valid JSON object."
         }
 
-    def _get_token_count(self, text: str, model_name: str) -> int:
-        """Helper to count tokens using tiktoken."""
-        if not text:
-            return 0
-        try:
-            # Attempt to get the encoding for the specific model
-            encoding = tiktoken.encoding_for_model(model_name)
-        except KeyError:
-            # Fallback to a default encoder if the model is not found
-            logger.warning(f"Model '{model_name}' not found by tiktoken. Using default encoder '{DEFAULT_ENCODER}'.")
-            encoding = tiktoken.get_encoding(DEFAULT_ENCODER)
-
-        return len(encoding.encode(text))
-
-    def _get_prompt_template_tokens(self, model_name: str) -> int:
-        """Calculates token count for the base prompt template (without the patch)."""
-        # This simulates _generate_prompt with an empty patch to count template tokens
-        # Ensure PROMPT and json_format_requirement are from self.prompts
-        user_prompt_template = os.getenv('PROMPT', self.prompts.get('default_review_prompt', ''))
-        json_format_template = self.prompts.get('json_format_requirement', '')
-
-        # Add markers for clarity, though they add a few tokens
-        template_text = f"{user_prompt_template}\n{json_format_template}\n--- BEGIN PATCH ---\n--- END PATCH ---"
-        return self._get_token_count(template_text, model_name)
-
-    def _generate_prompt(self, patch_content: str) -> str: # Renamed 'patch' to 'patch_content'
-        user_prompt = os.getenv('PROMPT', self.prompts['default_review_prompt'])
-        json_format_requirement = self.prompts['json_format_requirement']
-        # Markers to clearly delineate the patch for token calculation and review focus
-        return f"{user_prompt}\n{json_format_requirement}\n--- BEGIN PATCH ---\n{patch_content}\n--- END PATCH ---"
-
-    def _split_patch(self, full_patch: str, max_tokens_per_chunk: int, model: str) -> list[str]:
-        """Splits a large patch into chunks, trying to preserve file boundaries and diff context."""
-        chunks = []
-        if not full_patch:
-            return []
-
-        # Split by file diffs first: "diff --git a/... b/..."
-        # Regex to split by "diff --git " but keep the delimiter
-        file_diffs = []
-        current_diff = ""
-        for line in full_patch.splitlines(True): # Keep newlines
-            if line.startswith("diff --git ") and current_diff:
-                file_diffs.append(current_diff.strip())
-                current_diff = line
-            else:
-                current_diff += line
-        if current_diff: # Add the last diff
-            file_diffs.append(current_diff.strip())
-
-        if not file_diffs: # If no "diff --git " found, treat as one large block
-            file_diffs = [full_patch]
-
-        for file_diff in file_diffs:
-            file_diff_token_count = self._get_token_count(file_diff, model)
-
-            if file_diff_token_count <= max_tokens_per_chunk:
-                chunks.append(file_diff)
-            else:
-                # File diff is too large, split by lines (simplistic, could be by hunks)
-                logger.info(f"A file diff is too large ({file_diff_token_count} tokens), splitting by lines.")
-                lines = file_diff.splitlines(True)
-                current_chunk_lines = []
-                current_chunk_tokens = 0
-                header_lines = [line for line in lines if line.startswith("--- a/") or line.startswith("+++ b/") or line.startswith("diff --git ") or line.startswith("index ")]
-
-                for line in lines:
-                    # Always include header lines in each sub-chunk of this file_diff for context
-                    if line in header_lines and line not in current_chunk_lines:
-                        line_tokens = self._get_token_count("".join(header_lines), model) # Approx
-                    else:
-                        line_tokens = self._get_token_count(line, model)
-
-                    if current_chunk_tokens + line_tokens > max_tokens_per_chunk and current_chunk_lines:
-                        # Prepend necessary headers if not already there (basic context)
-                        final_chunk_lines = list(dict.fromkeys(header_lines + current_chunk_lines)) # Keep order, unique
-                        chunks.append("".join(final_chunk_lines))
-                        current_chunk_lines = []
-                        current_chunk_tokens = self._get_token_count("".join(header_lines), model) if header_lines else 0
-
-                    current_chunk_lines.append(line)
-                    current_chunk_tokens += line_tokens
-
-                if current_chunk_lines: # Add remaining part of the large diff
-                    final_chunk_lines = list(dict.fromkeys(header_lines + current_chunk_lines))
-                    chunks.append("".join(final_chunk_lines))
-        
-        # Post-process to ensure no chunk is truly empty if original patch was not
-        return [chunk for chunk in chunks if chunk.strip()]
-
-
-    def code_review(self, patch: str, model: str = 'gpt-4o-mini', temperature: float = 0.0, top_p: float = 1.0, max_tokens_for_response: int = None) -> dict: # Renamed max_tokens to max_tokens_for_response
-        if not patch:
-            return {"lgtm": True, "review_comment": ""}
-
-        start_time = time.time()
-
-        # Determine model's token limit
-        model_specific_limit = MODEL_TOKEN_LIMITS.get(model, MODEL_TOKEN_LIMITS['gpt-4o-mini']) # Default if model not in map
-        max_total_tokens = int(os.getenv('MAX_TOKENS_OVERRIDE', model_specific_limit))
-
-        # Calculate tokens for the prompt template (without the patch)
-        template_tokens = self._get_prompt_template_tokens(model)
-
-        # Calculate tokens for the patch itself
-        patch_tokens = self._get_token_count(patch, model)
-
-        # Total tokens for the initial full prompt (template + patch)
-        # The _generate_prompt adds markers, already accounted for in template_tokens if it uses _generate_prompt("")
-        # Or, more accurately:
-        base_user_prompt = os.getenv('PROMPT', self.prompts.get('default_review_prompt', ''))
-        base_json_req = self.prompts.get('json_format_requirement', '')
-        full_prompt_text_for_calc = f"{base_user_prompt}\n{base_json_req}\n--- BEGIN PATCH ---\n{patch}\n--- END PATCH ---"
-        current_prompt_total_tokens = self._get_token_count(full_prompt_text_for_calc, model)
-
-        logger.info(f"Model: {model}, Max Total Tokens: {max_total_tokens}")
-        logger.info(f"Template Tokens: {template_tokens}, Patch Tokens: {patch_tokens}, Current Prompt Total Tokens: {current_prompt_total_tokens}")
-
-        # Effective limit for the patch content itself, considering template and response buffer
-        # This is the target for each chunk if splitting is needed.
-        max_patch_tokens_for_single_request = max_total_tokens - template_tokens - PROMPT_RESPONSE_BUFFER
-
-        if current_prompt_total_tokens <= max_total_tokens:
-            logger.info("Patch fits within token limits. Processing as a single request.")
-            try:
-                # Use the `patch` variable directly as `_generate_prompt` expects the content part
-                prompt_to_send = self._generate_prompt(patch)
-
-                response = self.openai.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt_to_send}],
-                    model=model,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_tokens=max_tokens_for_response # This is for the response, not total prompt
-                )
-                content = response.choices[0].message.content
-                if content.startswith('```json\n'): content = content[8:]
-                if content.endswith('```'): content = content[:-3]
-                return json.loads(content)
-            except Exception as e:
-                logger.error(f"Error during single-chunk code review: {e}")
-                raise e
-            finally:
-                logger.info(f"Code review (single chunk) took {time.time() - start_time:.2f} seconds")
-        else:
-            logger.info(f"Patch exceeds token limits ({current_prompt_total_tokens} > {max_total_tokens}). Splitting into chunks.")
-            
-            max_review_chunks = int(os.getenv('MAX_REVIEW_CHUNKS', DEFAULT_MAX_REVIEW_CHUNKS))
-            # max_tokens_per_patch_chunk is the target for the content of the patch in each chunk
-            max_tokens_per_patch_chunk = max_patch_tokens_for_single_request
-            logger.info(f"Target max tokens for each patch chunk content: {max_tokens_per_patch_chunk}")
-
-            patch_chunks = self._split_patch(patch, max_tokens_per_patch_chunk, model)
-
-            if not patch_chunks:
-                logger.error("Patch splitting resulted in no chunks. Cannot proceed.")
-                return {"lgtm": False, "review_comment": "Error: Diff is too large or complex, and splitting failed."}
-
-            if len(patch_chunks) > max_review_chunks:
-                logger.error(f"Splitting resulted in {len(patch_chunks)} chunks, exceeding MAX_REVIEW_CHUNKS ({max_review_chunks}).")
-                return {"lgtm": False, "review_comment": f"Error: Diff is too large, resulting in {len(patch_chunks)} chunks (max {max_review_chunks}). Please review manually or submit smaller changes."}
-
-            aggregated_reviews_content = []
-            overall_lgtm = True
-
-            logger.info(f"Processing patch in {len(patch_chunks)} chunks.")
-
-            for i, chunk_content in enumerate(patch_chunks):
-                chunk_start_time = time.time()
-                logger.info(f"Reviewing chunk {i+1}/{len(patch_chunks)}...")
-                # Generate prompt for this specific chunk
-                prompt_chunk = self._generate_prompt(chunk_content)
-
-                try:
-                    response = self.openai.chat.completions.create(
-                        messages=[{"role": "user", "content": prompt_chunk}],
-                        model=model,
-                        temperature=temperature,
-                        top_p=top_p,
-                        max_tokens=max_tokens_for_response
-                    )
-                    content = response.choices[0].message.content
-                    if content.startswith('```json\n'): content = content[8:]
-                    if content.endswith('```'): content = content[:-3]
-
-                    review_data = json.loads(content)
-
-                    # Add a header to each chunk's review for clarity
-                    chunk_header = f"--- Review for Chunk {i+1}/{len(patch_chunks)} ---\n"
-                    aggregated_reviews_content.append(chunk_header + review_data.get('review_comment', 'No comment for this chunk.'))
-                    overall_lgtm = overall_lgtm and review_data.get('lgtm', True)
-                    logger.info(f"Chunk {i+1} review completed in {time.time() - chunk_start_time:.2f}s. LGTM: {review_data.get('lgtm')}")
-
-                except Exception as e:
-                    logger.error(f"Error during code review for chunk {i+1}: {e}")
-                    aggregated_reviews_content.append(f"--- Error reviewing Chunk {i+1}/{len(patch_chunks)} ---\n{str(e)}")
-                    overall_lgtm = False # Mark as not LGTM if any chunk fails
-
-            combined_review_string = "\n\n".join(aggregated_reviews_content)
-            logger.info(f"Aggregated code review (chunked) took {time.time() - start_time:.2f} seconds. Overall LGTM: {overall_lgtm}")
-            return {"lgtm": overall_lgtm, "review_comment": combined_review_string}
-        # The original finally block is removed as each path (single vs chunked) now has its own timing log.
-        # If a general finally is needed, it can be added here.
+    # The _load_prompts method is now defined above code_review
+    # This section will be replaced by the new code_review method.
+    # The old helper methods (_get_token_count, _generate_prompt, etc.) will be removed in the next step.
