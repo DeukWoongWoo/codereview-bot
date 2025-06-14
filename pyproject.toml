@@ -8,6 +8,7 @@ dependencies = [
     "openai>=1.76.2",
     "python-gitlab>=5.6.0",
     "pyyaml>=6.0.2",
+    "mlflow>=3.1.0",
 ]
 
 [dependency-groups]

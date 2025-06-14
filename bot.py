@@ -55,15 +55,39 @@ class GitlabBot:
                 if change.get('diff'):
                     patch += f"File: {change['new_path']}\n"
                     patch += f"{change['diff']}\n\n"
-            
+
+            # Gather user comments on the merge request
+            comments = ""
+            try:
+                notes = mr.notes.list(all=True)
+                user_notes = [note.body for note in notes if not getattr(note, "system", False)]
+                comments = "\n".join(user_notes)
+            except Exception as e:
+                logger.error(f"Failed to fetch merge request comments: {e}")
+
             # Get code review from ChatGPT
             try:
                 model = os.getenv('MODEL', 'gpt-4o-mini')
                 temperature = float(os.getenv('TEMPERATURE', 0.0))
                 top_p = float(os.getenv('TOP_P', 1.0))
                 max_tokens = os.getenv('MAX_TOKENS', None)
-                
-                review = chat.code_review({"description": mr.description, "patch": patch, "created_at": mr.created_at}, model, temperature, top_p, max_tokens)
+
+                review_context = {
+                    "description": mr.description,
+                    "comments": comments,
+                    "patch": patch,
+                    "created_at": mr.created_at,
+                }
+
+                chunk_size = int(os.getenv("CHUNK_SIZE", "0")) or None
+                review = chat.code_review_agent(
+                    review_context,
+                    model,
+                    temperature,
+                    top_p,
+                    max_tokens,
+                    chunk_size,
+                )
             except Exception as e:
                 logger.error(f"Error during code review: {e}")
                 return
