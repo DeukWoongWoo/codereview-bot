@@ -1,90 +1,22 @@
 import os
 import logging
-from typing import Optional
 import gitlab
-from chat import Chat
+from jinja2 import Template
+from openai import OpenAI
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class GitlabBot:
-    def __init__(self, gitlab_url: str, gitlab_token: str, openai_api_key: str):
-        self.gitlab_url = gitlab_url
-        self.gitlab_token = gitlab_token
-        self.openai_api_key = openai_api_key
-        
-        if not self.gitlab_token:
-            raise ValueError("GITLAB_TOKEN is required")
-            
-        self.gl = gitlab.Gitlab(self.gitlab_url, private_token=self.gitlab_token)
+def load_prompt(description, comments, changes):
+    with open('prompt.j2', 'r', encoding='utf-8') as f:
+        prompt_template = Template(f.read())
     
-    def load_chat(self) -> Optional[Chat]:
-        """Initialize Chat instance with OpenAI API key."""
-        if not self.openai_api_key:
-            logger.error("OPENAI_API_KEY is not set")
-            return None
-        
-        try:
-            return Chat(self.openai_api_key)
-        except Exception as e:
-            logger.error(f"Failed to initialize Chat: {e}")
-            return None
-
-    def handle_merge_request(self, project_id: int, merge_request_iid: int):
-        """Handle GitLab merge request events."""
-        try:
-            project = self.gl.projects.get(project_id)
-            mr = project.mergerequests.get(merge_request_iid)
-            
-            # Initialize chat
-            chat = self.load_chat()
-            if not chat:
-                logger.error("Chat initialization failed")
-                return
-            
-            # Get the changes (diff/patch)
-            changes = mr.changes()
-            if not changes.get('changes'):
-                logger.error("No changes found in merge request")
-                return
-            
-            # Combine all changes into a single patch
-            patch = ""
-            for change in changes['changes']:
-                if change.get('diff'):
-                    patch += f"File: {change['new_path']}\n"
-                    patch += f"{change['diff']}\n\n"
-            
-            # Get code review from ChatGPT
-            try:
-                model = os.getenv('MODEL', 'gpt-4o-mini')
-                temperature = float(os.getenv('TEMPERATURE', 0.0))
-                top_p = float(os.getenv('TOP_P', 1.0))
-                max_tokens = os.getenv('MAX_TOKENS', None)
-                
-                review = chat.code_review({"description": mr.description, "patch": patch, "created_at": mr.created_at}, model, temperature, top_p, max_tokens)
-            except Exception as e:
-                logger.error(f"Error during code review: {e}")
-                return
-
-            try:
-                # Create comment with review
-                comment = (
-                    "🤖 Code Review Bot\n\n"
-                    f"{'✅' if review['lgtm'] else '⚠️'} LGTM: {review['lgtm']}\n\n"
-                    f"{review['review_comment']}"
-                )
-                
-                mr.notes.create({'body': comment})
-            except Exception as e:
-                logger.error(f"Error during code review: {e}")
-                mr.notes.create({
-                    'body': f"❌ An error occurred while reviewing this merge request.\n error message: {e}\n\n original review comment : {review['review_comment']}"
-                })
-
-        except Exception as e:
-            logger.error(f"Error handling merge request: {e}")
+    return prompt_template.render(
+        description=description,
+        comments='\n'.join(comments),
+        changes=changes
+    )
 
 def main():
     required_env_vars = {
@@ -105,8 +37,61 @@ def main():
     GITLAB_TOKEN = required_env_vars["GITLAB_TOKEN"]
     OPENAI_API_KEY = required_env_vars["OPENAI_API_KEY"]
 
-    bot = GitlabBot(GITLAB_URL, GITLAB_TOKEN, OPENAI_API_KEY)
-    bot.handle_merge_request(PROJECT_ID, MR_IID)
+    # Get MR
+    gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN)
+    project = gl.projects.get(PROJECT_ID)
+    mr = project.mergerequests.get(MR_IID)
+
+    # Print MR description
+    print(f"MR Description: {mr.description}")
+
+    # Collect all non-system comments (notes)
+    mr_comments = []
+    for note in mr.notes.list():
+        # Exclude system notes (system=True) or author name is 'GitLab'
+        if getattr(note, 'system', False):
+            continue
+        if note.author and note.author.get('name') == 'GitLab':
+            continue
+        mr_comments.append(f"{note.author['name']}: {note.body}")
+
+    changes = mr.changes()
+    if not changes.get('changes'):
+        logger.error("No changes found in merge request")
+        return
+    
+    # Combine all changes into a single patch
+    patch = ""
+    for change in changes['changes']:
+        if change.get('diff'):
+            patch += f"File: {change['new_path']}\n"
+            patch += f"{change['diff']}\n\n"
+
+    prompt = load_prompt(mr.description, mr_comments, changes)
+
+    openai = OpenAI(
+        api_key=OPENAI_API_KEY,
+        base_url="https://api.openai.com/v1"
+    )
+
+    model = os.getenv("MODEL", "gpt-4o-mini")
+    temperature = float(os.getenv('TEMPERATURE', 0.0))
+    top_p = float(os.getenv('TOP_P', 1.0))
+    max_tokens = os.getenv('MAX_TOKENS', None)
+
+    response = openai.chat.completions.create(
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
+        model=model,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens
+    )
+
+    content = response.choices[0].message.content
+    mr.notes.create({'body': content})
+
 
 if __name__ == "__main__":
     main()
