@@ -29,6 +29,9 @@ An automated code review bot for GitLab merge requests using OpenAI's GPT models
    cp .env.example .env
    ```
    Edit `.env` file with your configuration:
+   > **Important:** Add your **actual tokens and secrets** to the `.env` file. **Never commit your real tokens or secrets to version control.**
+   >
+   > The `.env` file is included in `.gitignore` by default to help keep your credentials secure.
    ```
    CI_SERVER_URL=<your-gitlab-url>
    CI_PROJECT_ID=<project-id>

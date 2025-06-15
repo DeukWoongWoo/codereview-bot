@@ -29,7 +29,9 @@ def main():
     
     missing_vars = [var for var, value in required_env_vars.items() if not value]
     if missing_vars:
-        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+        logger.error(f"Missing required environment variables: {', '.join(missing_vars)}. Please ensure they are set in your .env file.")
+        raise ValueError("Check the logs for details.")
+
         
     GITLAB_URL = required_env_vars["CI_SERVER_URL"]
     PROJECT_ID = required_env_vars["CI_PROJECT_ID"]
@@ -42,9 +44,6 @@ def main():
     project = gl.projects.get(PROJECT_ID)
     mr = project.mergerequests.get(MR_IID)
 
-    # Print MR description
-    print(f"MR Description: {mr.description}")
-
     # Collect all non-system comments (notes)
     mr_comments = []
     for note in mr.notes.list():
@@ -53,7 +52,7 @@ def main():
             continue
         if note.author and note.author.get('name') == 'GitLab':
             continue
-        mr_comments.append(f"{note.author['name']}: {note.body}")
+        mr_comments.append(f"{note.body}")
 
     changes = mr.changes()
     if not changes.get('changes'):
@@ -68,6 +67,7 @@ def main():
             patch += f"{change['diff']}\n\n"
 
     prompt = load_prompt(mr.description, mr_comments, changes)
+    print(prompt)
 
     openai = OpenAI(
         api_key=OPENAI_API_KEY,
