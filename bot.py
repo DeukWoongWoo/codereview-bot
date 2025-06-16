@@ -66,7 +66,7 @@ def main():
             patch += f"File: {change['new_path']}\n"
             patch += f"{change['diff']}\n\n"
 
-    prompt = load_prompt(mr.description, mr_comments, changes)
+    prompt = load_prompt(mr.description, mr_comments, patch)
     print(prompt)
 
     openai = OpenAI(
